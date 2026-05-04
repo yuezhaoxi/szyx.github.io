@@ -321,6 +321,10 @@
             toastTimer = setTimeout(() => toast.classList.remove('show'), 2000);
         }
 
+        // ========== 共享内存（用于本地模拟联机） ==========
+        // 这里我们使用一个简单的对象来存房间。只在同一个浏览器里有效。
+        const localRoomsDB = new Map();
+
         // ========== 界面切换 ==========
         function startSingleGame(){
             roomConfig = {
@@ -390,6 +394,13 @@
             }
             if(editingPlayerIndex >= 0 && editingPlayerIndex < roomConfig.players.length){
                 roomConfig.players[editingPlayerIndex].name = newName;
+                // 更新本地数据库中的房间信息
+                if(roomConfig.code && localRoomsDB.has(roomConfig.code)){
+                    const roomInDB = localRoomsDB.get(roomConfig.code);
+                    if(roomInDB.players[editingPlayerIndex]){
+                        roomInDB.players[editingPlayerIndex].name = newName;
+                    }
+                }
                 showToast('✅ 名字已修改！');
                 updateRoomUI();
             }
@@ -414,36 +425,80 @@
             if(kickingPlayerIndex >= 0 && kickingPlayerIndex < roomConfig.players.length){
                 const kickedName = roomConfig.players[kickingPlayerIndex].name;
                 roomConfig.players.splice(kickingPlayerIndex, 1);
+                // 更新本地数据库
+                if(roomConfig.code && localRoomsDB.has(roomConfig.code)){
+                    const roomInDB = localRoomsDB.get(roomConfig.code);
+                    roomInDB.players = [...roomConfig.players]; // 同步数据库
+                }
                 showToast('🚫 已踢除 ' + kickedName);
                 updateRoomUI();
             }
             closeKickConfirmModal();
         }
 
-        // ========== 房间逻辑 ==========
+        // ========== 房间逻辑（改进版，带共享内存） ==========
         let roomConfig = { code: '', maxPlayers: 4, isHost: true, players: [] };
 
+        // 创建一个唯一的客户端ID，用于区分不同窗口/标签页
+        const clientId = Math.random().toString(36).substring(2, 8);
+        console.log('当前客户端ID:', clientId);
+
         function createRoom(maxPlayers){
+            const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+            
+            const newRoom = {
+                code: code,
+                maxPlayers: maxPlayers,
+                hostId: clientId,
+                players: [{ name: '房主', type: 'host', clientId: clientId }]
+            };
+            
+            // 存入本地“数据库”
+            localRoomsDB.set(code, newRoom);
+            
+            // 设置当前客户端的房间状态
             roomConfig = {
-                code: Math.random().toString(36).substring(2, 8).toUpperCase(),
+                code: code,
                 maxPlayers: maxPlayers,
                 isHost: true,
-                players: [{ name: '房主', type: 'host' }]
+                players: newRoom.players
             };
+            
             enterRoomScreen();
             showToast('✅ 房间创建成功！');
         }
 
         function joinRoom(code){
+            const roomInDB = localRoomsDB.get(code);
+            
+            if (!roomInDB) {
+                showToast('⚠️ 房间不存在或已关闭');
+                return;
+            }
+            
+            if (roomInDB.players.length >= roomInDB.maxPlayers) {
+                showToast('⚠️ 房间已满');
+                return;
+            }
+            
+            // 检查是否已经在房间中
+            const alreadyInRoom = roomInDB.players.some(p => p.clientId === clientId);
+            if (alreadyInRoom) {
+                showToast('⚠️ 你已经在房间中');
+                return;
+            }
+            
+            const newPlayer = { name: '新成员', type: 'self', clientId: clientId };
+            roomInDB.players.push(newPlayer);
+            
+            // 设置为当前客户端的房间配置
             roomConfig = {
                 code: code,
-                maxPlayers: 4,
+                maxPlayers: roomInDB.maxPlayers,
                 isHost: false,
-                players: [
-                    { name: '房主', type: 'host' },
-                    { name: '新成员', type: 'self' }
-                ]
+                players: roomInDB.players
             };
+            
             enterRoomScreen();
             showToast('✅ 成功加入房间！');
         }
@@ -458,19 +513,52 @@
         function addBot(){
             if(!roomConfig.isHost){ showToast('⚠️ 只有房主可以添加人机'); return; }
             if(roomConfig.players.length >= roomConfig.maxPlayers){ showToast('⚠️ 房间已满'); return; }
-            roomConfig.players.push({ name: '人机 ' + roomConfig.players.length, type: 'bot' });
+            const botName = '人机 ' + (roomConfig.players.length);
+            const newBot = { name: botName, type: 'bot', clientId: 'bot-' + Math.random() };
+            roomConfig.players.push(newBot);
+            
+            // 更新数据库
+            if(localRoomsDB.has(roomConfig.code)){
+                localRoomsDB.get(roomConfig.code).players = [...roomConfig.players];
+            }
+            
             showToast('🤖 已添加人机！');
             updateRoomUI();
         }
 
         function leaveRoom(){
+            if(roomConfig.code && localRoomsDB.has(roomConfig.code)){
+                const roomInDB = localRoomsDB.get(roomConfig.code);
+                // 如果不是单人模式，需要从数据库中移除自己
+                if(roomConfig.code !== 'SOLO'){
+                    roomInDB.players = roomInDB.players.filter(p => p.clientId !== clientId);
+                    if(roomInDB.players.length === 0){
+                        localRoomsDB.delete(roomConfig.code);
+                    }
+                }
+            }
+            
             roomConfig = { code: '', maxPlayers: 4, isHost: true, players: [] };
             roomScreen.style.display = 'none';
             coverScreen.style.display = 'flex';
             showToast('🚪 已离开房间');
         }
 
+        function refreshRoomFromDB(){
+            if(roomConfig.code && localRoomsDB.has(roomConfig.code)){
+                const roomInDB = localRoomsDB.get(roomConfig.code);
+                roomConfig.players = roomInDB.players;
+                updateRoomUI();
+            }
+        }
+
         function updateRoomUI(){
+            // 先尝试从数据库中获取最新的玩家列表
+            if(roomConfig.code && localRoomsDB.has(roomConfig.code)){
+                const roomInDB = localRoomsDB.get(roomConfig.code);
+                roomConfig.players = roomInDB.players;
+            }
+            
             document.getElementById('roomCode').innerText = roomConfig.code || '------';
             document.getElementById('roomMaxPlayers').innerText = roomConfig.maxPlayers;
             document.getElementById('roomCurrentPlayers').innerText = roomConfig.players.length;
@@ -480,15 +568,20 @@
 
             const listContainer = document.getElementById('playerList');
             let html = '<h4>👥 玩家列表 <span style="font-size:0.7em;color:#a8b8d0;">（点击名字可修改）</span></h4>';
+            
             roomConfig.players.forEach((p, index) => {
                 let slotClass = '', tagClass = '', tagText = '';
                 let isSelf = false;
+                
+                // 判断是否是当前客户端
+                const isCurrentClient = p.clientId === clientId;
+                
                 switch(p.type){
                     case 'host':
                         slotClass = 'host';
                         tagClass = 'tag-host';
                         tagText = '房主';
-                        isSelf = roomConfig.isHost;
+                        isSelf = isCurrentClient;
                         break;
                     case 'self':
                         slotClass = 'self';
@@ -507,10 +600,8 @@
                         tagText = '玩家';
                 }
 
-                // 自己的名字可以编辑（host类型且isHost，或self类型）
                 const canEdit = isSelf;
-                // 房主可以踢非host的成员
-                const canKick = roomConfig.isHost && p.type !== 'host';
+                const canKick = roomConfig.isHost && p.type !== 'host' && !isSelf;
 
                 html += `<div class="player-slot ${slotClass}">
                     <div class="player-info ${canEdit ? 'editable' : ''}" onclick="${canEdit ? `openEditNameModal(${index})` : ''}" title="${canEdit ? '点击修改名字' : ''}">
@@ -523,6 +614,7 @@
                     </div>
                 </div>`;
             });
+            
             for(let i=roomConfig.players.length; i<roomConfig.maxPlayers; i++){
                 html += `<div class="player-slot empty"><span>空位 ${i+1}</span><span class="player-tag tag-waiting">等待中</span></div>`;
             }
